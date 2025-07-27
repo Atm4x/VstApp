@@ -1,0 +1,93 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Teston.MainWindow"
+        Title="VST Chain Player"
+        Width="900" Height="600"
+        Background="#1E1E1E">
+
+  <Grid RowDefinitions="Auto,*,Auto">
+    <!-- Панель управления -->
+    <Border Grid.Row="0" Background="#2D2D30" Padding="10">
+      <StackPanel Orientation="Horizontal">
+        <Button Content="Добавить плагин" Click="AddPlugin_Click" Margin="0,0,5,0"/>
+        <Button Content="Выбрать аудио" Click="SelectAudio_Click" Margin="0,0,5,0"/>
+        <Button Content="Play" Click="Play_Click" Margin="0,0,5,0"/>
+        <Button Content="Stop" Click="Stop_Click"/>
+      </StackPanel>
+    </Border>
+
+    <!-- Основная область с плагинами и параметрами -->
+    <Grid Grid.Row="1" ColumnDefinitions="300,Auto,*" Background="#252526">
+      <!-- Список плагинов -->
+      <Border Grid.Column="0" BorderBrush="#3F3F46" BorderThickness="0,0,1,0">
+        <Grid RowDefinitions="Auto,*">
+          <TextBlock Grid.Row="0" Text="Цепочка плагинов"
+                    FontWeight="Bold"
+                    Margin="10,10,10,5"
+                    Foreground="#CCCCCC"/>
+
+          <ListBox x:Name="lstChain"
+                  Grid.Row="1"
+                  Margin="10,0,10,10"
+                  SelectionChanged="Chain_SelectionChanged"
+                  Background="#1E1E1E"
+                  Foreground="#CCCCCC">
+            <ListBox.ItemTemplate>
+              <DataTemplate>
+                <Border Padding="8,5" Margin="0,2">
+                  <TextBlock Text="{Binding}" Foreground="#CCCCCC"/>
+                </Border>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Grid>
+      </Border>
+
+      <!-- Разделитель -->
+      <GridSplitter Grid.Column="1"
+                   Width="3"
+                   Background="#3F3F46"
+                   ResizeDirection="Columns"/>
+
+      <!-- Панель параметров -->
+      <Border Grid.Column="2"
+             x:Name="pnlParametersContainer"
+             IsVisible="False"
+             Background="#252526">
+        <Grid RowDefinitions="Auto,*">
+          <TextBlock Grid.Row="0"
+                    x:Name="txtPluginName"
+                    Text="Параметры плагина"
+                    FontWeight="Bold"
+                    Margin="10,10,10,5"
+                    Foreground="#CCCCCC"/>
+
+          <ScrollViewer Grid.Row="1"
+                       HorizontalScrollBarVisibility="Disabled"
+                       VerticalScrollBarVisibility="Auto"
+                       Margin="10,0,10,10">
+            <StackPanel x:Name="pnlParameters" Spacing="10">
+              <!-- Параметры будут добавлены динамически -->
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+      </Border>
+
+      <!-- Заглушка когда плагин не выбран -->
+      <Border Grid.Column="2"
+             x:Name="pnlNoSelection"
+             IsVisible="True"
+             Background="#252526">
+        <TextBlock Text="Выберите плагин для настройки параметров"
+                  HorizontalAlignment="Center"
+                  VerticalAlignment="Center"
+                  Foreground="#808080"/>
+      </Border>
+    </Grid>
+
+    <!-- Статусная строка -->
+    <Border Grid.Row="2" Background="#007ACC" BorderThickness="0,1,0,0" BorderBrush="#3F3F46">
+      <TextBlock x:Name="txtStatus" Margin="10,5" Text="Статус: Готов" Foreground="#FFFFFF"/>
+    </Border>
+  </Grid>
+</Window>
