@@ -1,27 +1,45 @@
-﻿using System;
-using System.IO;
-using System.Threading.Tasks;
-using Avalonia;
+﻿using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using Avalonia.Threading;
-using Teston.Vst;
-using System.Linq;
+using Jacobi.Vst.Core;
+using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Teston.Vst;
+using NAudio.Wave;
 
 namespace Teston
 {
+    public class PluginItem
+    {
+        public string Name { get; set; }
+        public bool IsEnabled { get; set; }
+        public VstManager Manager { get; set; }
+    }
+
     public class MainWindow : Window
     {
         private VstChain _chain;
         private string _audioPath;
         private Task _playbackTask;
+        private WaveOutEvent _waveOut;
+        private BufferedWaveProvider _waveProvider;
+        private WaveStream _audioReader;
+        private ISampleProvider _sourceProvider;
+        private ISampleProvider _currentProcessedProvider;
+        private CancellationTokenSource _playbackCts;
+        private readonly object _providerLock = new object();
+        private readonly int _blockSize = 1024;
 
         public MainWindow()
         {
             AvaloniaXamlLoader.Load(this);
-            _chain = new VstChain(1024, 44100f); // По умолчанию
+            _chain = new VstChain(_blockSize, 44100f); // По умолчанию
         }
 
         private async void AddPlugin_Click(object? sender, RoutedEventArgs e)
@@ -35,6 +53,12 @@ namespace Teston
                     _chain.AddPlugin(result[0]);
                     UpdateChainList();
                     Console.WriteLine($"Плагин успешно добавлен. Всего в цепочке: {_chain.Managers.Count()}");
+
+                    // Динамическое обновление цепочки, если воспроизведение идёт
+                    if (_currentProcessedProvider != null)
+                    {
+                        RefreshProcessedProvider();
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -46,58 +70,150 @@ namespace Teston
 
         private async void SelectAudio_Click(object? sender, RoutedEventArgs e)
         {
-            var dialog = new OpenFileDialog { Filters = { new FileDialogFilter { Name = "WAV", Extensions = { "wav" } } } };
+            var dialog = new OpenFileDialog { Filters = { new FileDialogFilter { Name = "Audio Files", Extensions = { "wav", "mp3", "flac", "ogg" } } } };
             var result = await dialog.ShowAsync(this);
             if (result != null && result.Length > 0)
             {
                 _audioPath = result[0];
-                using var reader = new NAudio.Wave.WaveFileReader(_audioPath);
-                // НЕ пересоздаём _chain! Просто логируем
-                Console.WriteLine($"Аудио выбрано: {_audioPath}, SampleRate: {reader.WaveFormat.SampleRate}. Плагинов в цепочке: {_chain.Managers.Count()}");
-                this.FindControl<TextBlock>("txtStatus").Text = $"Выбран файл: {Path.GetFileName(_audioPath)}";
-            }
-        }
-
-        private void Play_Click(object? sender, RoutedEventArgs e)
-        {
-            if (string.IsNullOrEmpty(_audioPath))
-            {
-                _ = ShowMessageBox("Ошибка", "Выберите аудиофайл!");
-                return;
-            }
-
-            Console.WriteLine("Нажата Play. Запуск воспроизведения...");
-
-            _playbackTask = Task.Run(() =>
-            {
                 try
                 {
-                    Dispatcher.UIThread.InvokeAsync(() => this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...").Wait();
-                    _chain.ProcessAndPlay(_audioPath);
-                    Dispatcher.UIThread.InvokeAsync(() => this.FindControl<TextBlock>("txtStatus").Text = "Готово").Wait();
+                    var waveFormat = VstChain.GetAudioFormat(_audioPath);
+                    Console.WriteLine($"Аудио выбрано: {_audioPath}, SampleRate: {waveFormat.SampleRate}. Плагинов в цепочке: {_chain.Managers.Count()}");
+                    this.FindControl<TextBlock>("txtStatus").Text = $"Выбран файл: {Path.GetFileName(_audioPath)}";
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Ошибка в воспроизведении: {ex}");
-                    Dispatcher.UIThread.InvokeAsync(async () => await ShowMessageBox("Ошибка", ex.Message)).Wait();
+                    Console.WriteLine($"Ошибка чтения формата: {ex.Message}");
+                    await ShowMessageBox("Ошибка", $"Не удалось прочитать файл: {ex.Message}");
                 }
+            }
+        }
+
+        private async void Play_Click(object? sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(_audioPath))
+            {
+                await ShowMessageBox("Ошибка", "Выберите аудиофайл!");
+                return;
+            }
+
+            // Если на паузе, возобновить
+            if (_waveOut != null && _waveOut.PlaybackState == PlaybackState.Paused)
+            {
+                _waveOut.Play();
+                this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...";
+                this.FindControl<Button>("btnPause").Content = "Pause";
+                return;
+            }
+
+            // Полный запуск
+            try
+            {
+                _audioReader = VstChain.CreateAudioReader(_audioPath);
+                _sourceProvider = _audioReader.ToSampleProvider();
+                _currentProcessedProvider = _chain.CreateChainedProvider(_sourceProvider);
+                var outputFormat = _currentProcessedProvider.WaveFormat;
+                _waveProvider = new BufferedWaveProvider(outputFormat);
+                _waveOut = new WaveOutEvent();
+                _waveOut.Init(_waveProvider);
+                _waveOut.PlaybackStopped += WaveOut_PlaybackStopped;
+                _waveOut.Play();
+                _playbackCts = new CancellationTokenSource();
+                _playbackTask = Task.Run(() => PlaybackLoop(_playbackCts.Token));
+                this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...";
+                this.FindControl<Button>("btnPause").Content = "Pause";
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка в воспроизведении: {ex}");
+                await ShowMessageBox("Ошибка", ex.Message);
+            }
+        }
+
+        private void Pause_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_waveOut == null) return;
+
+            var btn = this.FindControl<Button>("btnPause");
+            if (_waveOut.PlaybackState == PlaybackState.Playing)
+            {
+                _waveOut.Pause();
+                btn.Content = "Resume";
+                this.FindControl<TextBlock>("txtStatus").Text = "Пауза";
+            }
+            else if (_waveOut.PlaybackState == PlaybackState.Paused)
+            {
+                _waveOut.Play();
+                btn.Content = "Pause";
+                this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...";
+            }
+        }
+
+        private void FullStop_Click(object? sender, RoutedEventArgs e)
+        {
+            if (_waveOut != null)
+            {
+                _waveOut.Stop(); // Вызовет PlaybackStopped
+            }
+        }
+
+        private void WaveOut_PlaybackStopped(object? sender, StoppedEventArgs e)
+        {
+            Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                this.FindControl<TextBlock>("txtStatus").Text = "Готово";
+                CleanupPlayback();
             });
         }
 
-        private void Stop_Click(object? sender, RoutedEventArgs e)
+        private void CleanupPlayback()
         {
-            // TODO: Добавьте остановку (например, waveOut.Stop() из VstChain)
-            Console.WriteLine("Нажата Stop.");
+            _playbackCts?.Cancel();
+            _waveOut?.Dispose();
+            _waveOut = null;
+            _audioReader?.Dispose();
+            _audioReader = null;
+            _currentProcessedProvider = null;
+            _waveProvider = null;
+            _playbackCts = null;
+            this.FindControl<Button>("btnPause").Content = "Pause";
+        }
+
+        private void PlaybackLoop(CancellationToken token)
+        {
+            if (_waveProvider == null) return;
+
+            int channels = _waveProvider.WaveFormat.Channels;
+            float[] floatBuffer = new float[_blockSize * channels];
+            byte[] byteBuffer = new byte[floatBuffer.Length * 4];
+
+            while (!token.IsCancellationRequested)
+            {
+                int samplesRead;
+                lock (_providerLock)
+                {
+                    if (_currentProcessedProvider == null) break;
+                    samplesRead = _currentProcessedProvider.Read(floatBuffer, 0, floatBuffer.Length);
+                }
+
+                if (samplesRead == 0) break;
+
+                Buffer.BlockCopy(floatBuffer, 0, byteBuffer, 0, samplesRead * 4);
+                _waveProvider.AddSamples(byteBuffer, 0, samplesRead * 4);
+
+                while (_waveProvider.BufferedDuration.TotalSeconds > 0.3 && !token.IsCancellationRequested)
+                {
+                    Thread.Sleep(50);
+                }
+            }
         }
 
         private void Chain_SelectionChanged(object? sender, SelectionChangedEventArgs e)
         {
             var listBox = (ListBox)sender;
-            if (listBox.SelectedIndex >= 0)
+            if (listBox.SelectedItem is PluginItem selected)
             {
-                var managers = _chain.Managers.ToArray();
-                var manager = managers[listBox.SelectedIndex];
-                UpdateParametersPanel(manager);
+                UpdateParametersPanel(selected.Manager);
             }
             else
             {
@@ -105,10 +221,66 @@ namespace Teston
             }
         }
 
+        private void PluginEnabled_Changed(object? sender, RoutedEventArgs e)
+        {
+            if (sender is CheckBox checkBox && checkBox.DataContext is PluginItem item)
+            {
+                item.Manager.IsEnabled = checkBox.IsChecked ?? false;
+                Console.WriteLine($"Плагин '{item.Name}' {(item.Manager.IsEnabled ? "включён" : "выключен")}");
+                // Нет нужды в refresh, так как IsEnabled влияет напрямую на ProcessAudio
+            }
+        }
+
+        private void Up_Click(object? sender, RoutedEventArgs e)
+        {
+            var listBox = this.FindControl<ListBox>("lstChain");
+            int index = listBox.SelectedIndex;
+            if (index > 0)
+            {
+                _chain.MovePlugin(index, index - 1);
+                UpdateChainList();
+                listBox.SelectedIndex = index - 1;
+                if (_waveOut?.PlaybackState == PlaybackState.Playing)
+                {
+                    RefreshProcessedProvider();
+                }
+            }
+        }
+
+        private void Down_Click(object? sender, RoutedEventArgs e)
+        {
+            var listBox = this.FindControl<ListBox>("lstChain");
+            int index = listBox.SelectedIndex;
+            if (index >= 0 && index < listBox.ItemCount - 1)
+            {
+                _chain.MovePlugin(index, index + 1);
+                UpdateChainList();
+                listBox.SelectedIndex = index + 1;
+                if (_waveOut?.PlaybackState == PlaybackState.Playing)
+                {
+                    RefreshProcessedProvider();
+                }
+            }
+        }
+
+        private void RefreshProcessedProvider()
+        {
+            lock (_providerLock)
+            {
+                _currentProcessedProvider = _chain.CreateChainedProvider(_sourceProvider);
+            }
+            Console.WriteLine("Цепочка обработки обновлена динамически.");
+        }
+
         private void UpdateChainList()
         {
             var listBox = this.FindControl<ListBox>("lstChain");
-            listBox.ItemsSource = _chain.Managers.Select(m => m.PluginName).ToList(); // В 11.x ItemsSource лучше
+            listBox.ItemsSource = _chain.Managers.Select(m => new PluginItem
+            {
+                Name = m.PluginName,
+                IsEnabled = m.IsEnabled,
+                Manager = m
+            }).ToList();
         }
 
         private void UpdateParametersPanel(VstManager manager)
@@ -116,109 +288,114 @@ namespace Teston
             var panel = this.FindControl<StackPanel>("pnlParameters");
             panel.Children.Clear();
 
-            // Показываем панель параметров и скрываем заглушку
             this.FindControl<Border>("pnlParametersContainer").IsVisible = true;
             this.FindControl<Border>("pnlNoSelection").IsVisible = false;
 
-            // Обновляем заголовок
-            this.FindControl<TextBlock>("txtPluginName").Text = $"Параметры: {manager.PluginName}";
+            this.FindControl<TextBlock>("txtPluginName").Text = manager.PluginName;
 
             foreach (var param in manager.GetParameters().Values)
             {
-                // Контейнер для параметра
-                var paramContainer = new Border
-                {
-                    Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#2D2D30")),
-                    BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#3F3F46")),
-                    BorderThickness = new Thickness(1),
-                    CornerRadius = new CornerRadius(4),
-                    Padding = new Thickness(10)
-                };
+                var paramContainer = new StackPanel { Spacing = 8 };
 
-                var paramPanel = new StackPanel { Spacing = 5 };
-
-                // Заголовок параметра
                 var headerPanel = new DockPanel();
                 var nameLabel = new TextBlock
                 {
                     Text = param.Name,
-                    FontWeight = Avalonia.Media.FontWeight.SemiBold,
-                    Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#CCCCCC"))
+                    Classes = { "param-name" }
                 };
                 var valueLabel = new TextBlock
                 {
                     Text = $"{param.Display} {param.Label}",
                     HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
-                    Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#569CD6"))
+                    Classes = { "param-value" }
                 };
 
                 DockPanel.SetDock(valueLabel, Dock.Right);
                 headerPanel.Children.Add(valueLabel);
                 headerPanel.Children.Add(nameLabel);
 
-                // Слайдер
                 var slider = new Slider
                 {
                     Minimum = 0,
                     Maximum = 1,
                     Value = param.Value,
-                    TickFrequency = 0.1,
-                    IsSnapToTickEnabled = false,
-                    Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#007ACC")),
-                    Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#3F3F46"))
+                    Height = 6,
+                    CornerRadius = new CornerRadius(3)
                 };
 
                 slider.ValueChanged += (s, args) =>
                 {
                     manager.SetParameter(param.Index, (float)args.NewValue);
-                    // Обновляем отображение значения
                     valueLabel.Text = $"{manager.GetParameters()[param.Index].Display} {param.Label}";
                 };
 
-                paramPanel.Children.Add(headerPanel);
-                paramPanel.Children.Add(slider);
-                paramContainer.Child = paramPanel;
+                paramContainer.Children.Add(headerPanel);
+                paramContainer.Children.Add(slider);
 
                 panel.Children.Add(paramContainer);
             }
 
-            // Кнопка открытия редактора
             var btnOpenEditor = new Button
             {
                 Content = "Открыть редактор плагина",
+                Classes = { "primary" },
                 HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch,
-                Margin = new Thickness(0, 10, 0, 0),
-                Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#007ACC")),
-                Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#FFFFFF"))
+                Margin = new Thickness(0, 20, 0, 0)
             };
             btnOpenEditor.Click += (s, args) => OpenVstEditorWindow(manager);
             panel.Children.Add(btnOpenEditor);
         }
+
         private void ResetParametersPanel()
         {
             var panel = this.FindControl<StackPanel>("pnlParameters");
             panel.Children.Clear();
 
-            // Скрываем панель параметров и показываем заглушку
             this.FindControl<Border>("pnlParametersContainer").IsVisible = false;
             this.FindControl<Border>("pnlNoSelection").IsVisible = true;
         }
 
-        private void OpenVstEditorWindow(VstManager manager)
+        private void OpenVstEditorWindow(VstManager mgr)
         {
-            var editorWindow = new Window
+            if ((mgr._pluginInfo.Flags & VstPluginFlags.HasEditor) == 0)
             {
-                Title = $"Editor: {manager.PluginName}",
-                Width = 400,
-                Height = 300,
-                CanResize = true
+                _ = ShowMessageBox("Инфо", "Этот плагин не имеет графического интерфейса.");
+                return;
+            }
+
+            var wnd = new Window
+            {
+                Title = $"Editor: {mgr.PluginName}",
+                Width = 700,
+                Height = 500
             };
 
-            manager.OpenEditor(editorWindow.TryGetPlatformHandle().Handle); // В 11.x напрямую Handle.Handle
+            var host = new VstEditorHost();
+            wnd.Content = host;
 
-            editorWindow.ShowDialog(this);
+            var idleTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+            idleTimer.Tick += (_, __) => mgr.EditorIdle();
 
-            editorWindow.Closed += (sender, e) => manager.CloseEditor();
+            wnd.Opened += (_, __) =>
+            {
+                if (host.ParentHwnd == IntPtr.Zero)
+                {
+                    Console.WriteLine("HWND не получен!");
+                    return;
+                }
+
+                Console.WriteLine($"Открываем GUI {mgr.PluginName}, hwnd={host.ParentHwnd}");
+                mgr.OpenEditor(host.ParentHwnd);
+                idleTimer.Start();
+            };
+
+            wnd.Closed += (_, __) =>
+            {
+                idleTimer.Stop();
+                mgr.CloseEditor();
+            };
+
+            wnd.ShowDialog(this);
         }
 
         private async Task ShowMessageBox(string title, string text)
@@ -229,6 +406,7 @@ namespace Teston
 
         protected override void OnClosed(EventArgs e)
         {
+            CleanupPlayback();
             _chain?.Dispose();
             base.OnClosed(e);
         }

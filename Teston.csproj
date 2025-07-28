@@ -8,6 +8,10 @@
     <Nullable>enable</Nullable>
     <Platforms>AnyCPU;x64;x86</Platforms>
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <GenerateApplicationManifest>false</GenerateApplicationManifest>
   </PropertyGroup>
 
   <ItemGroup>
@@ -38,6 +42,10 @@
     <None Update="DReverb2.dll">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Helpers\" />
   </ItemGroup>
 
 </Project>

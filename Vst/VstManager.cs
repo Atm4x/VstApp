@@ -12,7 +12,7 @@ namespace Teston.Vst
     {
         private readonly VstPluginContext _context;
         private readonly Jacobi.Vst.Core.Host.IVstPluginCommandStub _pluginCommandStub;
-        private readonly VstPluginInfo _pluginInfo;
+        public readonly VstPluginInfo _pluginInfo;
         private readonly int _blockSize;
         private readonly float _sampleRate;
 
@@ -28,6 +28,7 @@ namespace Teston.Vst
         public int OutputCount => _pluginInfo.AudioOutputCount;
         public int ParameterCount => _pluginInfo.ParameterCount;
         public bool IsProcessing => _isProcessing;
+        public bool IsEnabled { get; set; } = true;
 
         public VstManager(VstPluginContext context, int blockSize, float sampleRate)
         {
@@ -49,6 +50,11 @@ namespace Teston.Vst
         public void CloseEditor()
         {
             _pluginCommandStub.Commands.EditorClose();
+        }
+
+        public void EditorIdle()
+        {
+            _pluginCommandStub.Commands.EditorIdle();
         }
 
         private void InitializeBuffers()
@@ -148,6 +154,18 @@ namespace Teston.Vst
             {
                 if (output[i] == null || output[i].Length < _blockSize)
                     throw new ArgumentException($"Output channel {i} must have at least {_blockSize} samples, but has {output[i]?.Length ?? 0}");
+            }
+
+            if (!IsEnabled)
+            {
+                // Байпас: копируем input в output (минимальное кол-во каналов)
+                int channels = Math.Min(input.Length, output.Length);
+                for (int ch = 0; ch < channels; ch++)
+                {
+                    Array.Copy(input[ch], 0, output[ch], 0, _blockSize);
+                }
+                // Остальные output каналы остаются нулевыми (уже очищены)
+                return;
             }
 
             for (int i = 0; i < InputCount; i++)
