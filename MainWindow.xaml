@@ -121,6 +121,7 @@
 
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Spacing="12">
           <Button Content="Выбрать аудио" Classes="primary" Click="SelectAudio_Click" MinWidth="120"/>
+          <Button Content="Выбрать микрофон" Classes="primary" Click="SelectMic_Click" MinWidth="120"/>
           <Button Content="Play" Classes="play" Click="Play_Click" MinWidth="80"/>
           <Button Name="btnPause" Content="Pause" Classes="play" Click="Pause_Click" MinWidth="80"/>
           <Button Content="Stop" Classes="play" Click="FullStop_Click" MinWidth="80"/>

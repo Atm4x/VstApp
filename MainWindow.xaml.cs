@@ -26,15 +26,20 @@ namespace Teston
     {
         private VstChain _chain;
         private string _audioPath;
+        private int _micDevice = -1;
         private Task _playbackTask;
         private WaveOutEvent _waveOut;
         private BufferedWaveProvider _waveProvider;
+        private BufferedWaveProvider _inputBuffered;
         private WaveStream _audioReader;
+        private WaveInEvent _waveIn;
         private ISampleProvider _sourceProvider;
         private ISampleProvider _currentProcessedProvider;
         private CancellationTokenSource _playbackCts;
         private readonly object _providerLock = new object();
         private readonly int _blockSize = 1024;
+        private bool _isMicMode;
+        private bool _isPaused;
 
         public MainWindow()
         {
@@ -68,6 +73,19 @@ namespace Teston
             }
         }
 
+        private async void SelectMic_Click(object? sender, RoutedEventArgs e)
+        {
+            var dialog = new MicrophoneSettings();
+            await dialog.ShowDialog(this);
+            var selected = dialog.SelectedDevice;
+            if (selected >= 0)
+            {
+                _micDevice = selected;
+                _audioPath = null;
+                this.FindControl<TextBlock>("txtStatus").Text = $"Выбран микрофон: {WaveInEvent.GetCapabilities(selected).ProductName}";
+            }
+        }
+
         private async void SelectAudio_Click(object? sender, RoutedEventArgs e)
         {
             var dialog = new OpenFileDialog { Filters = { new FileDialogFilter { Name = "Audio Files", Extensions = { "wav", "mp3", "flac", "ogg" } } } };
@@ -75,6 +93,7 @@ namespace Teston
             if (result != null && result.Length > 0)
             {
                 _audioPath = result[0];
+                _micDevice = -1;
                 try
                 {
                     var waveFormat = VstChain.GetAudioFormat(_audioPath);
@@ -91,26 +110,42 @@ namespace Teston
 
         private async void Play_Click(object? sender, RoutedEventArgs e)
         {
-            if (string.IsNullOrEmpty(_audioPath))
-            {
-                await ShowMessageBox("Ошибка", "Выберите аудиофайл!");
-                return;
-            }
-
-            // Если на паузе, возобновить
             if (_waveOut != null && _waveOut.PlaybackState == PlaybackState.Paused)
             {
                 _waveOut.Play();
+                _isPaused = false;
                 this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...";
                 this.FindControl<Button>("btnPause").Content = "Pause";
                 return;
             }
 
-            // Полный запуск
+            if (string.IsNullOrEmpty(_audioPath) && _micDevice < 0)
+            {
+                await ShowMessageBox("Ошибка", "Выберите аудиофайл или микрофон!");
+                return;
+            }
+
             try
             {
-                _audioReader = VstChain.CreateAudioReader(_audioPath);
-                _sourceProvider = _audioReader.ToSampleProvider();
+                _isPaused = false;
+                if (!string.IsNullOrEmpty(_audioPath))
+                {
+                    _isMicMode = false;
+                    _audioReader = VstChain.CreateAudioReader(_audioPath);
+                    _sourceProvider = _audioReader.ToSampleProvider();
+                }
+                else
+                {
+                    _isMicMode = true;
+                    _waveIn = new WaveInEvent { DeviceNumber = _micDevice };
+                    _waveIn.WaveFormat = new WaveFormat(44100, 16, 2); // Соответствует SampleRate в VstChain
+                    _inputBuffered = new BufferedWaveProvider(_waveIn.WaveFormat);
+                    _waveIn.DataAvailable += WaveIn_DataAvailable;
+                    _sourceProvider = _inputBuffered.ToSampleProvider();
+                    _waveIn.StartRecording();
+                    this.FindControl<TextBlock>("txtStatus").Text = "Прослушивание микрофона...";
+                }
+
                 _currentProcessedProvider = _chain.CreateChainedProvider(_sourceProvider);
                 var outputFormat = _currentProcessedProvider.WaveFormat;
                 _waveProvider = new BufferedWaveProvider(outputFormat);
@@ -120,13 +155,21 @@ namespace Teston
                 _waveOut.Play();
                 _playbackCts = new CancellationTokenSource();
                 _playbackTask = Task.Run(() => PlaybackLoop(_playbackCts.Token));
-                this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...";
                 this.FindControl<Button>("btnPause").Content = "Pause";
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Ошибка в воспроизведении: {ex}");
                 await ShowMessageBox("Ошибка", ex.Message);
+            }
+        }
+
+
+        private void WaveIn_DataAvailable(object? sender, WaveInEventArgs e)
+        {
+            if (!_isPaused)
+            {
+                _inputBuffered.AddSamples(e.Buffer, 0, e.BytesRecorded);
             }
         }
 
@@ -138,14 +181,16 @@ namespace Teston
             if (_waveOut.PlaybackState == PlaybackState.Playing)
             {
                 _waveOut.Pause();
+                _isPaused = true;
                 btn.Content = "Resume";
                 this.FindControl<TextBlock>("txtStatus").Text = "Пауза";
             }
             else if (_waveOut.PlaybackState == PlaybackState.Paused)
             {
                 _waveOut.Play();
+                _isPaused = false;
                 btn.Content = "Pause";
-                this.FindControl<TextBlock>("txtStatus").Text = "Воспроизведение...";
+                this.FindControl<TextBlock>("txtStatus").Text = _isMicMode ? "Прослушивание микрофона..." : "Воспроизведение...";
             }
         }
 
@@ -173,9 +218,18 @@ namespace Teston
             _waveOut = null;
             _audioReader?.Dispose();
             _audioReader = null;
+            if (_waveIn != null)
+            {
+                _waveIn.StopRecording();
+                _waveIn.Dispose();
+                _waveIn = null;
+            }
+            _inputBuffered = null;
             _currentProcessedProvider = null;
             _waveProvider = null;
             _playbackCts = null;
+            _isPaused = false;
+            _isMicMode = false;
             this.FindControl<Button>("btnPause").Content = "Pause";
         }
 
@@ -189,6 +243,12 @@ namespace Teston
 
             while (!token.IsCancellationRequested)
             {
+                if (_isPaused)
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+
                 int samplesRead;
                 lock (_providerLock)
                 {
@@ -196,7 +256,12 @@ namespace Teston
                     samplesRead = _currentProcessedProvider.Read(floatBuffer, 0, floatBuffer.Length);
                 }
 
-                if (samplesRead == 0) break;
+                if (samplesRead == 0)
+                {
+                    if (!_isMicMode) break;
+                    Thread.Sleep(10);
+                    continue;
+                }
 
                 Buffer.BlockCopy(floatBuffer, 0, byteBuffer, 0, samplesRead * 4);
                 _waveProvider.AddSamples(byteBuffer, 0, samplesRead * 4);

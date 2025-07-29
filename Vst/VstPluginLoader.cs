@@ -22,7 +22,7 @@ namespace Teston.Vst
             }
             catch (Exception ex)
             {
-                throw new InvalidOperationException($"Не удалось загрузить VST плагин: {vstPath}", ex);
+                throw new InvalidOperationException($"Не удалось загрузить VST плагин: {vstPath} + {ex}");
             }
         }
 
